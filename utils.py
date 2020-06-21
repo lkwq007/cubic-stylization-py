@@ -2,7 +2,7 @@ from typing import List
 
 import numpy as np
 import scipy as sp
-
+from numba import jit,njit
 
 def normalize(V: np.ndarray) -> np.ndarray:
     # normalize vertice
@@ -26,12 +26,12 @@ def construct_adjacency_list(VF: np.ndarray, NI: np.ndarray) -> List[np.ndarray]
         adjacencyFList.append(faces)
     return adjacencyFList
 
-
+@njit
 def lasso_shrinkage(x: np.ndarray, k: float) -> np.ndarray:
     # Regression shrinkage and selection via the lasso
     return np.maximum(x - k, 0.0) - np.maximum(-x - k, 0.0)
 
-
+@njit
 def fit_rotation(S: np.ndarray):
     # orthogonal Procrustes
     SU, SS, SVH = np.linalg.svd(S, full_matrices=True)

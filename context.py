@@ -3,6 +3,8 @@ import igl
 import numpy as np
 import scipy as sp
 from utils import *
+import multiprocessing as mp
+import functools
 
 
 class Parameter:
@@ -20,6 +22,79 @@ class Parameter:
         self.reltol = 1e-3
         self.mu = 10.0
         self.tao = 2.0
+
+
+def compute(ctx, U, i):
+    # start parameter
+    z = ctx.zAll[:, i]
+    u = ctx.uAll[:, i]
+    n = np.transpose(ctx.N[i, :])
+    rho = ctx.rhoAll[i]
+    # energy parameter
+    hE = ctx.hEList[i]
+    U_hE0 = U[hE[:, 0], :]
+    U_hE1 = U[hE[:, 1], :]
+    dU = np.transpose(U_hE1 - U_hE0)
+    # compute Spre
+    dV = ctx.dVList[i]
+    WVec = ctx.WVecList[i]
+    Spre = dV.dot((WVec)).dot(np.transpose(dU))
+    for k in range(0, ctx.maxIterADMM):
+        # R step, rho is float
+        # S = Spre + rho * n.dot(np.transpose(z - u))
+        S = Spre + rho * np.outer(n, z - u)
+        R = fit_rotation(S)
+        zOld = np.array(z)
+        # z step, ctx.Lambda is float
+        z = lasso_shrinkage(R.dot(n) + u, ctx.param.Lambda * ctx.VA[i] / rho)
+        # u step
+        u = u + R.dot(n) - z
+        # residual
+        r_norm = np.linalg.norm(z - R.dot(n))
+        # rho is float
+        s_norm = np.linalg.norm(-rho * (z - zOld))
+
+        # rho setup
+        if r_norm > ctx.param.mu * s_norm:
+            rho = ctx.param.tao * rho
+            u = u / ctx.param.tao
+        elif s_norm > ctx.param.mu * r_norm:
+            rho = rho / ctx.param.tao
+            u = u * ctx.param.tao
+        # stopping
+        nz = float(z.shape[0])
+        eps_pri = np.sqrt(2.0 * nz) * ctx.param.abstol + ctx.param.reltol * max(np.linalg.norm(R.dot(n)),
+                                                                                np.linalg.norm(z))
+        eps_dual = np.sqrt(nz) * ctx.param.abstol + ctx.param.reltol * np.linalg.norm(rho * u)
+        if r_norm < eps_pri and s_norm < eps_dual:
+            # save into ctx
+            # ctx.zAll[:, i] = z
+            # ctx.uAll[:, i] = u
+            # ctx.rhoAll[i] = rho
+            # RAll[:, :, i] = R
+            # RAll[:, 3 * i:3 * i + 3] = R
+            # save energy
+            tmp = np.linalg.norm((R.dot(dV) - dU).dot((WVec)).dot(np.transpose(R.dot(dV) - dU)))
+            energy = 0.5 * tmp * tmp + ctx.param.Lambda * ctx.VA[i] * np.sum(np.abs(R.dot(n)))
+            # energyVec[i] = energy
+            return z, u, rho, R, energy
+
+
+def local_step_mp(V, U, RAll, ctx):
+    numV = V.shape[0]
+    energyVec = [0] * numV
+    RList = [None] * numV
+    with mp.Pool(processes=2) as pool:
+        ret = pool.map(functools.partial(compute, ctx, U), range(0, numV))
+    for i in range(0, numV):
+        z, u, rho, R, energy = ret[i]
+        energyVec[i] = energy
+        RAll[:, 3 * i:3 * i + 3] = R
+        ctx.zAll[:, i] = z
+        ctx.uAll[:, i] = u
+        ctx.rhoAll[i] = rho
+    ctx.energyVec = energyVec
+    ctx.energy = np.sum(ctx.energyVec)
 
 
 class Context:
@@ -87,6 +162,7 @@ class Context:
             V_hE0 = V[self.hEList[i][:, 0], :]
             V_hE1 = V[self.hEList[i][:, 1], :]
             self.dVList[i] = np.transpose(V_hE1 - V_hE0)
+            self.WVecList[i] = np.diag(self.WVecList[i])
         # other var
         numV = V.shape[0]
         self.zAll = np.random.rand(3, numV) * 2.0 - 1.0
@@ -100,6 +176,7 @@ class Context:
         RAll = np.zeros((3, 3 * V.shape[0]))
         # local step
         self.local_step(V, U, RAll)
+        # local_step_mp(V, U, RAll, self)
         # global step
         Upre = np.array(U)
         self.global_step(V, U, RAll)
@@ -109,7 +186,7 @@ class Context:
     def global_step(self, V, U, RAll):
         numV = V.shape[0]
         Rcol = columnize(RAll, numV)
-        Bcol = self.K.dot(Rcol)
+        Bcol = self.K @ Rcol
         # ret = igl.min_quad_with_fixed(self.L, B, self.b, self.bc, Aeq, Beq, False)
         for dim in range(0, V.shape[1]):
             b = np.array([self.b])
@@ -122,7 +199,7 @@ class Context:
 
     def local_step(self, V, U, RAll):
         numV = V.shape[0]
-        self.energyVec = np.zeros(numV)
+        energyVec = [0] * numV
         for i in range(0, numV):
             # start parameter
             z = self.zAll[:, i]
@@ -137,7 +214,75 @@ class Context:
             # compute Spre
             dV = self.dVList[i]
             WVec = self.WVecList[i]
-            Spre = dV.dot(np.diag(WVec)).dot(np.transpose(dU))
+            # Spre = dV.dot(np.diag(WVec)).dot(np.transpose(dU))
+            Spre = dV @ (WVec) @ (np.transpose(dU))
+            zOld = np.array(z)
+            for k in range(0, self.maxIterADMM):
+                # R step, rho is float
+                # S = Spre + rho * n.dot(np.transpose(z - u))
+                S = Spre + rho * np.outer(n, z - u)
+                R = fit_rotation(S)
+                # zOld = np.array(z)
+                zOld = z + 0
+                # z step, self.Lambda is float
+                Rn = R @ n
+                z = lasso_shrinkage(Rn + u, self.param.Lambda * self.VA[i] / rho)
+                # u step
+                u = u + Rn - z
+                # residual
+                r_norm = np.linalg.norm(z - Rn)
+                # rho is float
+                s_norm = np.linalg.norm(-rho * (z - zOld))
+
+                # rho setup
+                if r_norm > self.param.mu * s_norm:
+                    rho = self.param.tao * rho
+                    u = u / self.param.tao
+                elif s_norm > self.param.mu * r_norm:
+                    rho = rho / self.param.tao
+                    u = u * self.param.tao
+                # stopping
+                nz = float(z.shape[0])
+                eps_pri = np.sqrt(2.0 * nz) * self.param.abstol + self.param.reltol * max(np.linalg.norm(Rn),
+                                                                                          np.linalg.norm(z))
+                eps_dual = np.sqrt(nz) * self.param.abstol + self.param.reltol * np.linalg.norm(rho * u)
+                if r_norm < eps_pri and s_norm < eps_dual:
+                    # save into ctx
+                    self.zAll[:, i] = z
+                    self.uAll[:, i] = u
+                    self.rhoAll[i] = rho
+                    # RAll[:, :, i] = R
+                    RAll[:, 3 * i:3 * i + 3] = R
+                    # save energy
+                    RdVminusDU = R @ dV - dU
+                    tmp = np.linalg.norm((RdVminusDU) @ (WVec) @ (np.transpose(RdVminusDU)))
+                    energy = 0.5 * tmp * tmp + self.param.Lambda * self.VA[i] * np.sum(np.abs(Rn))
+                    energyVec[i] = energy
+                    break
+        self.energyVec = energyVec
+        self.energy = np.sum(self.energyVec)
+
+    def local_step_mp(self, V, U, RAll):
+        numV = V.shape[0]
+        energyVec = [0] * numV
+
+        RList = [None] * numV
+
+        def compute(i):
+            # start parameter
+            z = self.zAll[:, i]
+            u = self.uAll[:, i]
+            n = np.transpose(self.N[i, :])
+            rho = self.rhoAll[i]
+            # energy parameter
+            hE = self.hEList[i]
+            U_hE0 = U[hE[:, 0], :]
+            U_hE1 = U[hE[:, 1], :]
+            dU = np.transpose(U_hE1 - U_hE0)
+            # compute Spre
+            dV = self.dVList[i]
+            WVec = self.WVecList[i]
+            Spre = dV.dot((WVec)).dot(np.transpose(dU))
             for k in range(0, self.maxIterADMM):
                 # R step, rho is float
                 # S = Spre + rho * n.dot(np.transpose(z - u))
@@ -167,16 +312,27 @@ class Context:
                 eps_dual = np.sqrt(nz) * self.param.abstol + self.param.reltol * np.linalg.norm(rho * u)
                 if r_norm < eps_pri and s_norm < eps_dual:
                     # save into ctx
-                    self.zAll[:, i] = z
-                    self.uAll[:, i] = u
-                    self.rhoAll[i] = rho
+                    # self.zAll[:, i] = z
+                    # self.uAll[:, i] = u
+                    # self.rhoAll[i] = rho
                     # RAll[:, :, i] = R
-                    RAll[:, 3 * i:3 * i + 3] = R
+                    # RAll[:, 3 * i:3 * i + 3] = R
                     # save energy
-                    tmp = np.linalg.norm((R.dot(dV) - dU).dot(np.diag(WVec)).dot(np.transpose(R.dot(dV) - dU)))
+                    tmp = np.linalg.norm((R.dot(dV) - dU).dot((WVec)).dot(np.transpose(R.dot(dV) - dU)))
                     energy = 0.5 * tmp * tmp + self.param.Lambda * self.VA[i] * np.sum(np.abs(R.dot(n)))
-                    self.energyVec[i] = energy
-                    break
+                    # energyVec[i] = energy
+                    return z, u, rho, R, energy
+
+        with mp.Pool(processes=4) as pool:
+            ret = pool.map(compute, range(0, numV))
+        for i in range(0, numV):
+            z, u, rho, R, energy = ret[i]
+            energyVec[i] = energy
+            RAll[:, 3 * i:3 * i + 3] = R
+            self.zAll[:, i] = z
+            self.uAll[:, i] = u
+            self.rhoAll[i] = rho
+        self.energyVec = energyVec
         self.energy = np.sum(self.energyVec)
 
     def set_constrain(self, V, F):

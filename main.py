@@ -1,3 +1,4 @@
+# REF: https://github.com/HTDerekLiu/CubicStylization_Cpp
 import os
 import sys
 import argparse
@@ -9,8 +10,7 @@ import scipy as sp
 from utils import *
 from context import *
 
-
-
+import timeit
 
 # captialized
 if __name__ == "__main__":
@@ -35,11 +35,14 @@ if __name__ == "__main__":
     # optim loop
     maxIter = 1000
     stopRelativeDeltaV = 1e-3
+    start = timeit.default_timer()
     for iter in range(0, maxIter):
         ctx.optim_step(V, U)
         print("Iter at", iter, "Energy", ctx.energy, "RelativeDeltaV", ctx.relativeDeltaV)
         if ctx.relativeDeltaV < stopRelativeDeltaV:
             break
+    stop = timeit.default_timer()
+    print('Time: ', stop - start)
     output_name = os.path.splitext(filename)
     tmp="_cubic_{:.4}".format(opt.plambda)
     output_filename = tmp.join(output_name)
